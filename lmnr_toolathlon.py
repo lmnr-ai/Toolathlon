@@ -29,6 +29,17 @@ Three things about this harness need working around, hence the module:
      through the version-gated auto-instrumentation.
   3. The Agents SDK's default processor uploads to OpenAI's tracing backend.
      We replace the processor list rather than appending to it.
+
+One deployment note, since it bites hard and silently: `uv pip install lmnr`
+moves shared transitive pins (opentelemetry-*) off `uv.lock`, and the stdio MCP
+servers launched with `uv run` re-sync the project on startup. That resync
+re-downloads the locked wheels inside the server subprocess, and if the index is
+slow the server blows its `client_session_timeout_seconds` and never connects.
+`UV_NO_SYNC` does not help: `MCPServerStdio` hands `params.env` to the mcp SDK
+verbatim, so the subprocess only ever sees the `env:` block from the server's
+yaml. Either add `lmnr` to `pyproject.toml` so the lock stays consistent, or
+point the yaml `command` at `.venv/bin/python` and drop `uv run` from the launch
+path.
 """
 
 from __future__ import annotations
