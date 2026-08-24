@@ -11,6 +11,8 @@ import os
 from utils.openai_agents_monkey_patch.custom_run_impl import *
 from utils.openai_agents_monkey_patch.custom_mcp_util import *
 
+import lmnr_toolathlon  # noqa: F401  Laminar tracing; no-op without LMNR_PROJECT_API_KEY
+
 
 async def main():
     parser = argparse.ArgumentParser(description="Run demo agent evaluation")
