@@ -178,7 +178,13 @@ def _finish(Laminar: Any, eval_res: dict[str, Any] | None = None) -> None:
 
     # Toolathlon's own accounting is authoritative when the log file exists;
     # `agent_llm_requests` is the count of model calls the agent actually made.
-    # The processor's tally is only a fallback for runs that died early.
+    # The processor's tally is only a fallback for runs that died before writing
+    # the log -- and the test is `is not None`, not truthiness, because a
+    # genuine 0 is the single most important value here. It means the agent loop
+    # never got a completion back, and the tally would hide exactly that: a
+    # rejected request still opens and ends a generation span, so a task that
+    # spent every one of its inner steps failing the same call would report
+    # dozens of steps against Toolathlon's zero.
     stats = {}
     if _RootSpan.log_file and os.path.exists(_RootSpan.log_file):
         try:
@@ -187,7 +193,8 @@ def _finish(Laminar: Any, eval_res: dict[str, Any] | None = None) -> None:
             stats = dump.get("key_stats") or {}
             detail["status"] = dump.get("status")
             detail["agent_cost"] = (dump.get("agent_cost") or {}).get("total_cost")
-            num_steps = stats.get("agent_llm_requests") or num_steps
+            if stats.get("agent_llm_requests") is not None:
+                num_steps = stats["agent_llm_requests"]
         except Exception:
             logger.exception("could not read Toolathlon stats from %s", _RootSpan.log_file)
 
