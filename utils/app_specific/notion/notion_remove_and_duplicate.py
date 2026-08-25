@@ -34,9 +34,20 @@ async def main():
         show_output=True
     )
 
+    # `notion_page_duplicator` drives Notion's hosted MCP server through
+    # `mcp-remote`, which needs the interactive OAuth state that
+    # `global_preparation.special_setup_notion_official` writes to
+    # `configs/.mcp-auth`; without it the preprocess blocks forever on a
+    # callback and the task dies at its timeout with nothing in the log. The
+    # REST duplicator needs only the integration key already in the configs.
+    # Set NOTION_DUPLICATOR=official on a machine that has completed that setup.
+    duplicator = ("notion_page_duplicator"
+                  if os.environ.get("NOTION_DUPLICATOR") == "official"
+                  else "notion_rest_duplicator")
+
     print_color(f"Duplicating new page {args.needed_subpage_name} from {notion_source_page_url} to {notion_eval_page_url}","cyan")
     await run_command(
-        f"uv run -m utils.app_specific.notion.notion_page_duplicator "
+        f"uv run -m utils.app_specific.notion.{duplicator} "
         f"--source-parent {notion_source_page_url} "
         f"--child-name \"{args.needed_subpage_name}\" "
         f"--target-parent {notion_eval_page_url} "
