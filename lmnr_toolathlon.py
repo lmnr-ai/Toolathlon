@@ -35,11 +35,12 @@ moves shared transitive pins (opentelemetry-*) off `uv.lock`, and the stdio MCP
 servers launched with `uv run` re-sync the project on startup. That resync
 re-downloads the locked wheels inside the server subprocess, and if the index is
 slow the server blows its `client_session_timeout_seconds` and never connects.
-`UV_NO_SYNC` does not help: `MCPServerStdio` hands `params.env` to the mcp SDK
-verbatim, so the subprocess only ever sees the `env:` block from the server's
-yaml. Either add `lmnr` to `pyproject.toml` so the lock stays consistent, or
-point the yaml `command` at `.venv/bin/python` and drop `uv run` from the launch
-path.
+Exporting `UV_NO_SYNC` in the parent does nothing about it -- the mcp SDK builds
+the subprocess environment as `get_default_environment() | params.env`, and
+`get_default_environment()` inherits only HOME/LOGNAME/PATH/SHELL/TERM/USER. So
+either add `lmnr` to `pyproject.toml` to keep the lock consistent, or put
+`UV_NO_SYNC: "1"` in the `env:` block of each `uv`-launched server's yaml, which
+is the only channel that reaches it.
 """
 
 from __future__ import annotations
@@ -75,55 +76,179 @@ def _install() -> None:
         LaminarAgentsTraceProcessor,
     )
 
+    from agents.tracing.span_data import GenerationSpanData, ResponseSpanData
+
+    class CountingAgentsTraceProcessor(LaminarAgentsTraceProcessor):
+        """Tallies model calls so `num_steps` survives a run that never evaluates.
+
+        The Toolathlon log file's `agent_llm_requests` is preferred when it
+        exists; this only covers runs that die before writing it.
+        """
+
+        def on_span_end(self, span: Any) -> None:
+            if isinstance(getattr(span, "span_data", None), (GenerationSpanData, ResponseSpanData)):
+                _RootSpan.llm_calls += 1
+            super().on_span_end(span)
+
     GLOBAL_TRACE_PROVIDER.set_disabled(False)
     # `model_provider` re-disables tracing whenever it is imported; swallow
     # that call rather than depending on import order.
     GLOBAL_TRACE_PROVIDER.set_disabled = lambda disabled: None
-    set_trace_processors([LaminarAgentsTraceProcessor()])
+    set_trace_processors([CountingAgentsTraceProcessor()])
 
     _wrap_task_runner(Laminar)
     atexit.register(Laminar.flush)
 
 
-def _metadata(task_config: Any, agent_config: Any) -> dict[str, Any]:
+def _base_metadata(task_config: Any, agent_config: Any) -> dict[str, Any]:
+    """The metadata known before the task starts.
+
+    The key set is fixed by the trajectory consumer, so keep the names and the
+    value types stable: `generated` is a bool, `num_steps` an int, and the
+    free-form `metadata` key is a JSON string (Laminar metadata values are
+    scalars, so a nested object has to be encoded).
+    """
     model = getattr(agent_config, "model", None)
     meta = {
-        "benchmark": "toolathlon",
-        "task_id": getattr(task_config, "id", None),
-        "task_dir": getattr(task_config, "task_dir", None),
+        "source": "toolathlon",
+        "domain": "general",
+        "generated": True,
+        "harness": "openai-agents",
         "model": getattr(model, "short_name", None),
-        "provider": getattr(model, "provider", None),
-        "max_turns": getattr(task_config, "max_turns", None),
-        "max_steps": getattr(task_config, "max_steps_under_single_turn_mode", None),
-        "single_turn_mode": getattr(task_config, "single_turn_mode", None),
-        "mcp_servers": ",".join(getattr(task_config, "needed_mcp_servers", None) or []),
-        "launch_time": getattr(task_config, "launch_time", None),
+        "task_id": getattr(task_config, "id", None),
     }
     return {k: v for k, v in meta.items() if v is not None}
 
 
+def _details(task_config: Any, agent_config: Any) -> dict[str, Any]:
+    """The descriptive half of the free-form `metadata` value."""
+    model = getattr(agent_config, "model", None)
+    detail = {
+        "task_id": getattr(task_config, "id", None),
+        "task_dir": getattr(task_config, "task_dir", None),
+        "provider": getattr(model, "provider", None),
+        "max_turns": getattr(task_config, "max_turns", None),
+        "max_steps": getattr(task_config, "max_steps_under_single_turn_mode", None),
+        "single_turn_mode": getattr(task_config, "single_turn_mode", None),
+        "mcp_servers": getattr(task_config, "needed_mcp_servers", None) or [],
+        "run_id": os.environ.get("TOOLATHLON_RUN_ID"),
+    }
+    return {k: v for k, v in detail.items() if v is not None}
+
+
+class _RootSpan:
+    """The task's root span, held open until the evaluator has run.
+
+    `main.py` evaluates *after* `TaskRunner.run_single_task` returns, so a
+    context manager around the run would close the span before the verdict and
+    the final token counts exist. Instead the span is started by hand, kept
+    current for the duration of the run, and closed by the evaluator hook (or
+    by `atexit`, if the run dies before evaluation).
+    """
+
+    span: Any = None
+    details: dict[str, Any] = {}
+    llm_calls: int = 0
+    log_file: str | None = None
+
+
+def _clip(value: Any, limit: int = 4000) -> Any:
+    """Keep an evaluator message from dominating the trace's metadata.
+
+    Some evaluators dump a full per-row diff on failure. The head carries the
+    verdict; the tail is the same complaint repeated, and the whole thing still
+    lives in the run's `eval_res.json`.
+    """
+    if isinstance(value, str) and len(value) > limit:
+        return value[:limit] + f"... [{len(value) - limit} more chars]"
+    return value
+
+
+def _finish(Laminar: Any, eval_res: dict[str, Any] | None = None) -> None:
+    """Attach the outcome to the root span and end it. Idempotent."""
+    span = _RootSpan.span
+    if span is None:
+        return
+    _RootSpan.span = None
+
+    import json
+
+    detail = dict(_RootSpan.details)
+    num_steps = _RootSpan.llm_calls
+
+    # Toolathlon's own accounting is authoritative when the log file exists;
+    # `agent_llm_requests` is the count of model calls the agent actually made.
+    # The processor's tally is only a fallback for runs that died early.
+    stats = {}
+    if _RootSpan.log_file and os.path.exists(_RootSpan.log_file):
+        try:
+            with open(_RootSpan.log_file, encoding="utf-8") as f:
+                dump = json.load(f)
+            stats = dump.get("key_stats") or {}
+            detail["status"] = dump.get("status")
+            detail["agent_cost"] = (dump.get("agent_cost") or {}).get("total_cost")
+            num_steps = stats.get("agent_llm_requests") or num_steps
+        except Exception:
+            logger.exception("could not read Toolathlon stats from %s", _RootSpan.log_file)
+
+    if stats:
+        detail["key_stats"] = stats
+    if eval_res is not None:
+        detail["evaluation"] = {
+            "pass": eval_res.get("pass", False),
+            "details": _clip(eval_res.get("details")),
+            "failure": _clip(eval_res.get("failure")),
+        }
+
+    try:
+        with Laminar.use_span(span, end_on_exit=False):
+            Laminar.set_trace_metadata(
+                {"metadata": json.dumps(detail, default=str), "num_steps": int(num_steps)}
+            )
+            if eval_res is not None:
+                Laminar.set_span_output(
+                    {"pass": eval_res.get("pass", False), **detail.get("evaluation", {})}
+                )
+    except Exception:
+        logger.exception("could not attach Laminar trace metadata")
+    finally:
+        span.end()
+        Laminar.flush()
+
+
 def _wrap_task_runner(Laminar: Any) -> None:
-    """Wrap each task run in a root span carrying the task's metadata."""
+    """Open the root span around the run and close it after evaluation."""
     from utils.task_runner.runner import TaskRunner
+    from utils.evaluation.evaluator import TaskEvaluator
 
     original_run_single_task = TaskRunner.run_single_task
+    original_evaluate = TaskEvaluator.evaluate_from_log_file
 
     async def traced_run_single_task(task_config, agent_config, *args, **kwargs):
         task_id = getattr(task_config, "id", "unknown")
-        with Laminar.start_as_current_span(
+        _RootSpan.details = _details(task_config, agent_config)
+        _RootSpan.log_file = getattr(task_config, "log_file", None)
+        _RootSpan.span = Laminar.start_span(
             name=f"toolathlon.task.{task_id}",
             input={"task": getattr(task_config, "task_str", None)},
             session_id=os.environ.get("TOOLATHLON_RUN_ID") or task_id,
-            metadata=_metadata(task_config, agent_config),
+            metadata=_base_metadata(task_config, agent_config),
             tags=["toolathlon"],
-        ):
-            status = await original_run_single_task(
+        )
+        with Laminar.use_span(_RootSpan.span, end_on_exit=False):
+            return await original_run_single_task(
                 task_config, agent_config, *args, **kwargs
             )
-            Laminar.set_span_output(getattr(status, "value", str(status)))
-            return status
+
+    async def traced_evaluate(log_file_path: str, *args, **kwargs):
+        eval_res = await original_evaluate(log_file_path, *args, **kwargs)
+        _finish(Laminar, eval_res)
+        return eval_res
 
     TaskRunner.run_single_task = staticmethod(traced_run_single_task)
+    TaskEvaluator.evaluate_from_log_file = staticmethod(traced_evaluate)
+    # A run that crashes before evaluation still gets a closed, exported span.
+    atexit.register(_finish, Laminar, None)
 
 
 if _PROJECT_API_KEY:
