@@ -791,9 +791,18 @@ class OpenAIChatCompletionsModelWithRetry(OpenAIChatCompletionsModel):
                     else []
                 )
 
+            # `add_cached_token_details` has already put the provider-reported
+            # cached count on `usage`, but openai-agents 0.0.15 has no
+            # `input_tokens_details` field, so a tracing processor reading the
+            # span sees only the two totals. Pass the details through in the
+            # shape newer SDKs use so observability tooling can bill cache
+            # reads correctly.
             span_generation.span_data.usage = {
                 "input_tokens": usage.input_tokens,
                 "output_tokens": usage.output_tokens,
+                "input_tokens_details": {
+                    "cached_tokens": getattr(usage, "cached_input_tokens", None) or 0,
+                },
             }
 
             return ModelResponse(
